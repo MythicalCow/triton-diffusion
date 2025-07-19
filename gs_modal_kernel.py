@@ -66,7 +66,7 @@ def run_gray_scott_simulation():
     print("Triton working correctly!")
 
     # Set device to CPU for the actual simulation
-    device = torch.device("cpu")
+    device = torch.device("cuda")
     print(f"Running Gray-Scott simulation on device: {device}")
 
     # simulation parameters
@@ -82,8 +82,8 @@ def run_gray_scott_simulation():
     video_name = "grayscott.mp4"
 
     # Initialize fields - start with the equilibrium state
-    U = torch.ones((height, width), dtype=torch.float32, device=device)
-    V = torch.zeros((height, width), dtype=torch.float32, device=device)
+    U = torch.ones((height, width), dtype=torch.float32, device='cuda')
+    V = torch.zeros((height, width), dtype=torch.float32, device='cuda')
 
     images_per_chunk = 10
 
@@ -92,7 +92,6 @@ def run_gray_scott_simulation():
 
     U_pinned = torch.empty_like(U_CHUNK_GPU, device='cpu', pin_memory=True)
     V_pinned = torch.empty_like(V_CHUNK_GPU, device='cpu', pin_memory=True)
-
 
     # Create more varied, artistic blob seeds with general shapes
     torch.manual_seed(int(time.time()))  # Use current time for true randomness
@@ -189,7 +188,7 @@ def run_gray_scott_simulation():
             blob = create_organic_shape(cx, cy, base_size, open_shape=True)
 
         # Random intensity for each blob
-        intensity = np.random.uniform(0.6, 1.0)
+        intensity = torch.empty(1, device='cuda').uniform_(0.6, 1.0)
 
         # Add to V and subtract from U
         V += intensity * blob
@@ -320,10 +319,8 @@ def run_gray_scott_simulation():
         grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
         grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
         grid = (grid_x, grid_y)
-        U_gpu = U.cuda()
-        V_gpu = V.cuda()
-        gs_update_kernel[grid](U_gpu, V_gpu, Lu, Lv, F, k, dt, Du, Dv, N, BLOCK_SIZE)
-        return U_gpu, V_gpu
+        gs_update_kernel[grid](U, V, Lu, Lv, F, k, dt, Du, Dv, N, BLOCK_SIZE)
+        return U, V
 
     # Vibrant cyberpunk colormap
     colors = [
@@ -351,7 +348,7 @@ def run_gray_scott_simulation():
         # chunk the gpu outputs
         if step % 5 == 0:
             # calculate within chunk position
-            idx = step % 500
+            idx = step % 50
             idx = idx // 5
 
             # store the gpu array result
@@ -359,25 +356,12 @@ def run_gray_scott_simulation():
             V_CHUNK_GPU[idx] = V
 
         # batch coloration of images for rendering (will convert this to gpu)
-        if step % 500 == 0:
+        if step % 50 == 49:
             V_pinned.copy_(V_CHUNK_GPU, non_blocking=True)
             U_pinned.copy_(U_CHUNK_GPU, non_blocking=True)
             for i in range(images_per_chunk):
                 # Use V for visualization - move to CPU for numpy operations
                 img = V_pinned[i].numpy()
-
-                # Check if we have any variation
-                v_min, v_max = np.min(img), np.max(img)
-                if v_max - v_min > 1e-6:
-                    img = (img - v_min) / (v_max - v_min)
-                else:
-                    # If no variation, try visualizing U instead
-                    img = U_pinned[i].numpy()
-                    u_min, u_max = np.min(img), np.max(img)
-                    if u_max - u_min > 1e-6:
-                        img = (img - u_min) / (u_max - u_min)
-                    else:
-                        img = img * 0
 
                 # Enhanced contrast and saturation
                 img = img ** 0.5  # Less gamma correction for more vibrant colors
