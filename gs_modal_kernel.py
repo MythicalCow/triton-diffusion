@@ -69,8 +69,10 @@ def run_gray_scott_simulation():
     device = torch.device("cpu")
     print(f"Running Gray-Scott simulation on device: {device}")
 
-    # Original simulation parameters
-    width, height = 512, 512
+    # simulation parameters
+    N = 512
+    BLOCK_SIZE = 32 # creates block of size BLOCK_SIZE x BLOCK_SIZE
+    width, height = N, N
     Du, Dv = 0.16, 0.07
     F, k = 0.037, 0.0625
     dt = 1.0
@@ -200,11 +202,6 @@ def run_gray_scott_simulation():
     print(f"Initial U range: [{U.min():.4f}, {U.max():.4f}]")
     print(f"Initial V range: [{V.min():.4f}, {V.max():.4f}]")
 
-
-    # creates block of size BLOCK_SIZE x BLOCK_SIZE
-    N = 512
-    BLOCK_SIZE = 32
-
     @triton.jit
     def laplacian_kernel(
         input_ptr, output_ptr,
@@ -258,19 +255,66 @@ def run_gray_scott_simulation():
         grid = (grid_x, grid_y)
         Z_gpu = Z.cuda()
         output = torch.zeros_like(Z_gpu)
-        laplacian_kernel[grid](Z_gpu, output.cuda(), N, BLOCK_SIZE)
-        return output.cpu()
+        laplacian_kernel[grid](Z_gpu, output, N, BLOCK_SIZE)
+        return output
 
+    @triton.jit
+    def gs_update_kernel(
+        U_ptr, V_ptr,
+        Lu_ptr, Lv_ptr,
+        F, k, dt, Du, Dv,
+        N: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid_x = tl.program_id(0)
+        pid_y = tl.program_id(1)
+
+        x_start = pid_x * BLOCK_SIZE
+        y_start = pid_y * BLOCK_SIZE
+
+        offs_x = tl.arange(0, BLOCK_SIZE)
+        offs_y = tl.arange(0, BLOCK_SIZE)
+
+        x = x_start + offs_x[:, None]
+        y = y_start + offs_y[None, :]
+        mask = (x >= 0) & (x <= N-1) & (y >= 0) & (y <= N-1)
+
+        U = tl.load(U_ptr + y*N + x, mask=mask, other=0)
+        V = tl.load(V_ptr + y*N + x, mask=mask, other=0)
+        Lu = tl.load(Lu_ptr + y*N + x, mask=mask, other=0)
+        Lv = tl.load(Lv_ptr + y*N + x, mask=mask, other=0)
+        reaction = U * V * V
+
+        updateU = (Du * Lu - reaction + F * (1 - U)) * dt
+        updateV = (Dv * Lv + reaction - (F + k) * V) * dt
+
+        newU = U + updateU
+        newV = V + updateV
+
+        # Clip values between 0 and 1
+        clippedU = tl.where(newU > 1.0, 1.0, tl.where(newU < 0.0, 0.0, newU))
+        clippedV = tl.where(newV > 1.0, 1.0, tl.where(newV < 0.0, 0.0, newV))
+
+        tl.store(U_ptr + y*N + x, clippedU, mask=mask)
+        tl.store(V_ptr + y*N + x, clippedV, mask=mask)
 
     def update(U, V):
         Lu = laplacian_gpu_caller(U)
         Lv = laplacian_gpu_caller(V)
-        reaction = U * V * V
-        U += (Du * Lu - reaction + F * (1 - U)) * dt
-        V += (Dv * Lv + reaction - (F + k) * V) * dt
-        U = torch.clamp(U, 0, 1)
-        V = torch.clamp(V, 0, 1)
-        return U, V
+        # Lu = laplacian(U)
+        # Lv = laplacian(VD
+        # reaction = U * V * V
+        # U += (Du * Lu - reaction + F * (1 - U)) * dt
+        # V += (Dv * Lv + reaction - (F + k) * V) * dt
+        # U = torch.clamp(U, 0, 1)
+        # V = torch.clamp(V, 0, 1)
+        grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
+        grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+        grid = (grid_x, grid_y)
+        U_gpu = U.cuda()
+        V_gpu = V.cuda()
+        gs_update_kernel[grid](U_gpu, V_gpu, Lu, Lv, F, k, dt, Du, Dv, N, BLOCK_SIZE)
+        return U_gpu.cpu(), V_gpu.cpu()
 
     # Vibrant cyberpunk colormap
     colors = [
