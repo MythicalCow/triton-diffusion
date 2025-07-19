@@ -256,8 +256,9 @@ def run_gray_scott_simulation():
         grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
         grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
         grid = (grid_x, grid_y)
-        output = torch.zeros_like(Z)
-        laplacian_kernel[grid](Z.cuda(), output.cuda(), N, BLOCK_SIZE)
+        Z_gpu = Z.cuda()
+        output = torch.zeros_like(Z_gpu)
+        laplacian_kernel[grid](Z_gpu, output.cuda(), N, BLOCK_SIZE)
         return output.cpu()
 
 
