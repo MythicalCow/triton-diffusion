@@ -74,7 +74,7 @@ def run_gray_scott_simulation():
     BLOCK_SIZE = 32 # creates block of size BLOCK_SIZE x BLOCK_SIZE
     width, height = N, N
     Du, Dv = 0.16, 0.07
-    F, k = 0.037, 0.0625
+    F, k = 0.012, 0.05
     dt = 1.0
     video_fps = 200
 
@@ -84,6 +84,9 @@ def run_gray_scott_simulation():
     # Initialize fields - start with the equilibrium state
     U = torch.ones((height, width), dtype=torch.float32, device=device)
     V = torch.zeros((height, width), dtype=torch.float32, device=device)
+
+    images_per_chunk = 10
+    IMG_CHUNK_GPU = torch.ones((images_per_chunk, height, width), dtype=torch.float32, device='cuda')
 
     # Create more varied, artistic blob seeds with general shapes
     torch.manual_seed(int(time.time()))  # Use current time for true randomness
@@ -162,7 +165,7 @@ def run_gray_scott_simulation():
 
     # Create different types of artistic shapes
     for i in range(num_blobs):
-        # Random center for each blob (scaled for higher resolution)
+        # Random center for each blob
         cx = width / 2
         cy = height / 2
 
@@ -314,7 +317,7 @@ def run_gray_scott_simulation():
         U_gpu = U.cuda()
         V_gpu = V.cuda()
         gs_update_kernel[grid](U_gpu, V_gpu, Lu, Lv, F, k, dt, Du, Dv, N, BLOCK_SIZE)
-        return U_gpu.cpu(), V_gpu.cpu()
+        return U_gpu, V_gpu
 
     # Vibrant cyberpunk colormap
     colors = [
