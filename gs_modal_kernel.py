@@ -202,6 +202,8 @@ def run_gray_scott_simulation():
 
 
     # creates block of size BLOCK_SIZE x BLOCK_SIZE
+    N = 512
+    BLOCK_SIZE = 32
 
     @triton.jit
     def laplacian_kernel(
@@ -209,7 +211,6 @@ def run_gray_scott_simulation():
         N: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
-        def idx(x, y): return y * N + x
         pid_x = tl.program_id(0)
         pid_y = tl.program_id(1)
 
@@ -219,22 +220,28 @@ def run_gray_scott_simulation():
         offs_x = tl.arange(0, BLOCK_SIZE)
         offs_y = tl.arange(0, BLOCK_SIZE)
 
-        x = x_start + offs_x
-        y = y_start + offs_y
-
+        x = x_start + offs_x[:, None]
+        y = y_start + offs_y[None, :]
         mask = (x > 0) & (x < N - 1) & (y > 0) & (y < N - 1)
 
-        center = tl.load(input_ptr + idx(x, y), mask=mask, other=0)
-        left   = tl.load(input_ptr + idx(x - 1, y), mask=mask, other=0)
-        right  = tl.load(input_ptr + idx(x + 1, y), mask=mask, other=0)
-        up     = tl.load(input_ptr + idx(x, y - 1), mask=mask, other=0)
-        down   = tl.load(input_ptr + idx(x, y + 1), mask=mask, other=0)
+
+        center_idx = y * N + x
+        left_idx = y * N + (x - 1)
+        right_idx = y * N + (x + 1)
+        up_idx = (y - 1) * N + x
+        down_idx = (y + 1) * N + x
+
+        center = tl.load(input_ptr + center_idx, mask=mask, other=0)
+        left   = tl.load(input_ptr + left_idx, mask=mask, other=0)
+        right  = tl.load(input_ptr + right_idx, mask=mask, other=0)
+        up     = tl.load(input_ptr + up_idx, mask=mask, other=0)
+        down   = tl.load(input_ptr + down_idx, mask=mask, other=0)
 
         # Example computation: Laplacian
         out = -4 * center + left + right + up + down
 
         # Store result
-        tl.store(output_ptr + idx(x, y), out, mask=mask)
+        tl.store(output_ptr + center_idx, out, mask=mask)
 
     def laplacian(Z):
         return (
@@ -245,9 +252,18 @@ def run_gray_scott_simulation():
             torch.roll(Z, -1, dims=1)
         )
 
+    def laplacian_gpu_caller(Z):
+        grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
+        grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+        grid = (grid_x, grid_y)
+        output = torch.zeros_like(Z)
+        laplacian_kernel[grid](Z.cuda(), output.cuda(), N, BLOCK_SIZE)
+        return output.cpu()
+
+
     def update(U, V):
-        Lu = laplacian(U)
-        Lv = laplacian(V)
+        Lu = laplacian_gpu_caller(U)
+        Lv = laplacian_gpu_caller(V)
         reaction = U * V * V
         U += (Du * Lu - reaction + F * (1 - U)) * dt
         V += (Dv * Lv + reaction - (F + k) * V) * dt
