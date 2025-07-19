@@ -86,7 +86,13 @@ def run_gray_scott_simulation():
     V = torch.zeros((height, width), dtype=torch.float32, device=device)
 
     images_per_chunk = 10
-    IMG_CHUNK_GPU = torch.ones((images_per_chunk, height, width), dtype=torch.float32, device='cuda')
+
+    U_CHUNK_GPU = torch.zeros((images_per_chunk, height, width), dtype=torch.float32, device='cuda')
+    V_CHUNK_GPU = torch.zeros((images_per_chunk, height, width), dtype=torch.float32, device='cuda')
+
+    U_pinned = torch.empty_like(U_CHUNK_GPU, device='cpu', pin_memory=True)
+    V_pinned = torch.empty_like(V_CHUNK_GPU, device='cpu', pin_memory=True)
+
 
     # Create more varied, artistic blob seeds with general shapes
     torch.manual_seed(int(time.time()))  # Use current time for true randomness
@@ -342,33 +348,47 @@ def run_gray_scott_simulation():
         if step % 100 == 0:
             print(f"Step {step}: U range [{U.min():.4f}, {U.max():.4f}], V range [{V.min():.4f}, {V.max():.4f}]")
 
+        # chunk the gpu outputs
         if step % 5 == 0:
-            # Use V for visualization - move to CPU for numpy operations
-            img = V.cpu().numpy()
+            # calculate within chunk position
+            idx = step % 500
+            idx = idx // 5
 
-            # Check if we have any variation
-            v_min, v_max = np.min(img), np.max(img)
-            if v_max - v_min > 1e-6:
-                img = (img - v_min) / (v_max - v_min)
-            else:
-                # If no variation, try visualizing U instead
-                img = U.cpu().numpy()
-                u_min, u_max = np.min(img), np.max(img)
-                if u_max - u_min > 1e-6:
-                    img = (img - u_min) / (u_max - u_min)
+            # store the gpu array result
+            U_CHUNK_GPU[idx] = U
+            V_CHUNK_GPU[idx] = V
+
+        # batch coloration of images for rendering (will convert this to gpu)
+        if step % 500 == 0:
+            V_pinned.copy_(V_CHUNK_GPU, non_blocking=True)
+            U_pinned.copy_(U_CHUNK_GPU, non_blocking=True)
+            for i in range(images_per_chunk):
+                # Use V for visualization - move to CPU for numpy operations
+                img = V_pinned[i].numpy()
+
+                # Check if we have any variation
+                v_min, v_max = np.min(img), np.max(img)
+                if v_max - v_min > 1e-6:
+                    img = (img - v_min) / (v_max - v_min)
                 else:
-                    img = img * 0
+                    # If no variation, try visualizing U instead
+                    img = U_pinned[i].numpy()
+                    u_min, u_max = np.min(img), np.max(img)
+                    if u_max - u_min > 1e-6:
+                        img = (img - u_min) / (u_max - u_min)
+                    else:
+                        img = img * 0
 
-            # Enhanced contrast and saturation
-            img = img ** 0.5  # Less gamma correction for more vibrant colors
+                # Enhanced contrast and saturation
+                img = img ** 0.5  # Less gamma correction for more vibrant colors
 
-            # Add slight contrast boost
-            img = np.clip(img * 1.2 - 0.1, 0, 1)
+                # Add slight contrast boost
+                img = np.clip(img * 1.2 - 0.1, 0, 1)
 
-            # Convert to color
-            img_color = custom_cmap(img)[..., :3]
-            img_uint8 = (img_color * 255).astype(np.uint8)
-            frames.append(img_uint8)
+                # Convert to color
+                img_color = custom_cmap(img)[..., :3]
+                img_uint8 = (img_color * 255).astype(np.uint8)
+                frames.append(img_uint8)
 
     print(f"Generated {len(frames)} frames")
 
