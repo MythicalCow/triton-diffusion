@@ -75,6 +75,7 @@ def run_gray_scott_simulation():
     width, height = N, N
     Du, Dv = 0.16, 0.07
     F, k = 0.012, 0.05
+    # F, k = 0.037, 0.0625
     dt = 1.0
     video_fps = 200
 
@@ -206,10 +207,6 @@ def run_gray_scott_simulation():
     U = torch.clamp(U, 0, 1)
     V = torch.clamp(V, 0, 1)
 
-    print(f"Created {num_blobs} random artistic blob seeds")
-    print(f"Initial U range: [{U.min():.4f}, {U.max():.4f}]")
-    print(f"Initial V range: [{V.min():.4f}, {V.max():.4f}]")
-
     @triton.jit
     def laplacian_kernel(
         input_ptr, output_ptr,
@@ -333,11 +330,45 @@ def run_gray_scott_simulation():
         (1.0, 0.2, 0.8)       # Hot pink
     ]
     custom_cmap = LinearSegmentedColormap.from_list("cyberpunk", colors, N=256)
+    samples = np.linspace(0, 1, 256)
+    colormap_rgb = custom_cmap(samples)[:, :3]
+
+    #GPU friendly linear interpolation mapper buffer
+    torch_colormap = torch.tensor(colormap_rgb, dtype=torch.float32, device="cuda").flatten()
+
+    @triton.jit
+    def cyberpunk_colormap_kernel(
+        img_ptr, img_rgb_ptr,
+        torch_colormap_ptr,
+        img_min, img_max,
+        N: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    ):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N * N  # flat index
+
+        val = tl.load(img_ptr + offsets, mask=mask, other=0)
+        val = tl.where(img_max - img_min > 1e-6, (val - img_min)/(img_max - img_min), val)
+        val = tl.sqrt(val)
+
+        # clippedU = tl.where(newU > 1.0, 1.0, tl.where(newU < 0.0, 0.0, newU))
+        val = val * 1.2 - 0.1
+        val = tl.where(val > 1.0, 1.0, tl.where(val < 0.0, 0.0, val))
+
+        idx = (val * 255).to(tl.uint32)
+        base_offset = idx * 3
+        r = tl.load(torch_colormap_ptr + base_offset + 0, mask=mask) * 255
+        g = tl.load(torch_colormap_ptr + base_offset + 1, mask=mask) * 255
+        b = tl.load(torch_colormap_ptr + base_offset + 2, mask=mask) * 255
+
+        tl.store(img_rgb_ptr + offsets * 3 + 0, r.to(tl.uint8), mask=mask)
+        tl.store(img_rgb_ptr + offsets * 3 + 1, g.to(tl.uint8), mask=mask)
+        tl.store(img_rgb_ptr + offsets * 3 + 2, b.to(tl.uint8), mask=mask)
 
     # Create video in memory
     frames = []
 
     start = time.time()
+    grid = ((N * N + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     for step in tqdm(range(steps)):
         U, V = update(U, V)
 
@@ -350,29 +381,32 @@ def run_gray_scott_simulation():
             # calculate within chunk position
             idx = step % 50
             idx = idx // 5
-
-            # store the gpu array result
-            U_CHUNK_GPU[idx] = U
             V_CHUNK_GPU[idx] = V
 
         # batch coloration of images for rendering (will convert this to gpu)
+
         if step % 50 == 49:
-            V_pinned.copy_(V_CHUNK_GPU, non_blocking=True)
-            U_pinned.copy_(U_CHUNK_GPU, non_blocking=True)
+            img_rgb = torch.empty(N * N * 3, dtype=torch.uint8, device="cuda")
             for i in range(images_per_chunk):
-                # Use V for visualization - move to CPU for numpy operations
-                img = V_pinned[i].numpy()
+                # # Use V for visualization - move to CPU for numpy operations
 
-                # Enhanced contrast and saturation
-                img = img ** 0.5  # Less gamma correction for more vibrant colors
+                # # Enhanced contrast and saturation
+                # img = img ** 0.5  # Less gamma correction for more vibrant colors
 
-                # Add slight contrast boost
-                img = np.clip(img * 1.2 - 0.1, 0, 1)
+                # # Add slight contrast boost
+                # img = np.clip(img * 1.2 - 0.1, 0, 1)
 
-                # Convert to color
-                img_color = custom_cmap(img)[..., :3]
-                img_uint8 = (img_color * 255).astype(np.uint8)
-                frames.append(img_uint8)
+                v_min, v_max = float(V_CHUNK_GPU[i].min()), float(V_CHUNK_GPU[i].max())
+                # if v_max - v_min > 1e-6:
+                #     img = (img - v_min) / (v_max - v_min)
+
+                # # Convert to color
+                # img_color = custom_cmap(img)[..., :3]
+                # img_uint8 = (img_color * 255).astype(np.uint8)
+                # frames.append(img_uint8)
+                cyberpunk_colormap_kernel[grid](V_CHUNK_GPU[i], img_rgb, torch_colormap, v_min, v_max, N, BLOCK_SIZE)
+                img_rgb_reshaped = img_rgb.view(N, N, 3)
+                frames.append(img_rgb_reshaped.cpu().numpy())
 
     print(f"Generated {len(frames)} frames")
 
