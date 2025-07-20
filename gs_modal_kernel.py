@@ -2,6 +2,7 @@ import modal
 from io import BytesIO
 import triton
 import triton.language as tl
+from triton.testing import do_bench
 
 # Create Modal app
 app = modal.App("gray-scott-triton")
@@ -180,12 +181,12 @@ def run_gray_scott_simulation():
 
         if shape_type == 'organic':
             # Organic irregular shape (closed)
-            base_size = np.random.uniform(30, 80)  # Scaled for higher resolution
+            base_size = np.random.uniform(30 * (N // 512), 80 * (N // 512))  # Scaled for higher resolution
             blob = create_organic_shape(cx, cy, base_size, open_shape=False)
 
         elif shape_type == 'organic_open':
             # Organic irregular shape (open)
-            base_size = np.random.uniform(30, 80)  # Scaled for higher resolution
+            base_size = np.random.uniform(30 * (N // 512), 80 * (N // 512))  # Scaled for higher resolution
             blob = create_organic_shape(cx, cy, base_size, open_shape=True)
 
         # Random intensity for each blob
@@ -245,6 +246,47 @@ def run_gray_scott_simulation():
         # Store result
         tl.store(output_ptr + center_idx, out, mask=mask)
 
+    @triton.jit
+    def laplacian_kernel_uv(
+        U_ptr, V_ptr, Lu_ptr, Lv_ptr,
+        N: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid_x = tl.program_id(0)
+        pid_y = tl.program_id(1)
+
+        x_start = pid_x * BLOCK_SIZE
+        y_start = pid_y * BLOCK_SIZE
+
+        offs_x = tl.arange(0, BLOCK_SIZE)
+        offs_y = tl.arange(0, BLOCK_SIZE)
+
+        x = x_start + offs_x[:, None]
+        y = y_start + offs_y[None, :]
+        mask = (x > 0) & (x < N - 1) & (y > 0) & (y < N - 1)
+
+
+        center_idx = y * N + x
+        left_idx = y * N + (x - 1)
+        right_idx = y * N + (x + 1)
+        up_idx = (y - 1) * N + x
+        down_idx = (y + 1) * N + x
+
+        #U, V
+        U_center, V_center = tl.load(U_ptr + center_idx, mask=mask, other=0), tl.load(V_ptr + center_idx, mask=mask, other=0)
+        U_left, V_left = tl.load(U_ptr + left_idx, mask=mask, other=0), tl.load(V_ptr + left_idx, mask=mask, other=0)
+        U_right, V_right = tl.load(U_ptr + right_idx, mask=mask, other=0), tl.load(V_ptr + right_idx, mask=mask, other=0)
+        U_up, V_up = tl.load(U_ptr + up_idx, mask=mask, other=0), tl.load(V_ptr + up_idx, mask=mask, other=0)
+        U_down, V_down = tl.load(U_ptr + down_idx, mask=mask, other=0), tl.load(V_ptr + down_idx, mask=mask, other=0)
+
+        # Compute Laplacians
+        Lu_out = -4 * U_center + U_left + U_right + U_up + U_down
+        Lv_out = -4 * V_center + V_left + V_right + V_up + V_down
+
+        # Store results
+        tl.store(Lu_ptr + center_idx, Lu_out, mask=mask)
+        tl.store(Lv_ptr + center_idx, Lv_out, mask=mask)
+
     def laplacian(Z):
         return (
             -4 * Z +
@@ -254,14 +296,10 @@ def run_gray_scott_simulation():
             torch.roll(Z, -1, dims=1)
         )
 
-    def laplacian_gpu_caller(Z):
-        grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
-        grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
-        grid = (grid_x, grid_y)
-        Z_gpu = Z.cuda()
-        output = torch.zeros_like(Z_gpu)
-        laplacian_kernel[grid](Z_gpu, output, N, BLOCK_SIZE)
-        return output
+    # def laplacian_gpu_caller(Z):
+    #     output = torch.zeros_like(Z)
+    #     laplacian_kernel[grid](Z, output, N, BLOCK_SIZE)
+    #     return output
 
     @triton.jit
     def gs_update_kernel(
@@ -303,19 +341,13 @@ def run_gray_scott_simulation():
         tl.store(U_ptr + y*N + x, clippedU, mask=mask)
         tl.store(V_ptr + y*N + x, clippedV, mask=mask)
 
+    grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
+    grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+    grid = (grid_x, grid_y)
+    Lu = torch.zeros_like(U)
+    Lv = torch.zeros_like(V)
     def update(U, V):
-        Lu = laplacian_gpu_caller(U)
-        Lv = laplacian_gpu_caller(V)
-        # Lu = laplacian(U)
-        # Lv = laplacian(VD
-        # reaction = U * V * V
-        # U += (Du * Lu - reaction + F * (1 - U)) * dt
-        # V += (Dv * Lv + reaction - (F + k) * V) * dt
-        # U = torch.clamp(U, 0, 1)
-        # V = torch.clamp(V, 0, 1)
-        grid_x = (N + BLOCK_SIZE - 1) // BLOCK_SIZE  # Ceiling division
-        grid_y = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
-        grid = (grid_x, grid_y)
+        laplacian_kernel_uv[grid](U, V, Lu, Lv, N, BLOCK_SIZE)
         gs_update_kernel[grid](U, V, Lu, Lv, F, k, dt, Du, Dv, N, BLOCK_SIZE)
         return U, V
 
@@ -338,19 +370,28 @@ def run_gray_scott_simulation():
 
     @triton.jit
     def cyberpunk_colormap_kernel(
-        img_ptr, img_rgb_ptr,
-        torch_colormap_ptr,
-        img_min, img_max,
+        img_ptr, # batch of 10 images of size N * N
+        img_rgb_ptr, # batch of 10 rgb output images of size 3 * N * N
+        torch_colormap_ptr, # cyberpunk style linear interpolation map
+        img_min_ptr, # array of 10 mins
+        img_max_ptr, # array of 10 maxs
         N: tl.constexpr, BLOCK_SIZE: tl.constexpr
     ):
+        img_index = tl.program_id(1)
+        img_offset = img_index * N * N
+        rgb_offset = img_index * N * N * 3
+
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < N * N  # flat index
 
-        val = tl.load(img_ptr + offsets, mask=mask, other=0)
+        # Reading the minimums for this array
+        img_min = tl.load(img_min_ptr + img_index)
+        img_max = tl.load(img_max_ptr + img_index)
+
+        val = tl.load(img_ptr + img_offset + offsets, mask=mask, other=0)
         val = tl.where(img_max - img_min > 1e-6, (val - img_min)/(img_max - img_min), val)
         val = tl.sqrt(val)
 
-        # clippedU = tl.where(newU > 1.0, 1.0, tl.where(newU < 0.0, 0.0, newU))
         val = val * 1.2 - 0.1
         val = tl.where(val > 1.0, 1.0, tl.where(val < 0.0, 0.0, val))
 
@@ -360,15 +401,17 @@ def run_gray_scott_simulation():
         g = tl.load(torch_colormap_ptr + base_offset + 1, mask=mask) * 255
         b = tl.load(torch_colormap_ptr + base_offset + 2, mask=mask) * 255
 
-        tl.store(img_rgb_ptr + offsets * 3 + 0, r.to(tl.uint8), mask=mask)
-        tl.store(img_rgb_ptr + offsets * 3 + 1, g.to(tl.uint8), mask=mask)
-        tl.store(img_rgb_ptr + offsets * 3 + 2, b.to(tl.uint8), mask=mask)
+        tl.store(img_rgb_ptr + rgb_offset + offsets * 3 + 0, r.to(tl.uint8), mask=mask)
+        tl.store(img_rgb_ptr + rgb_offset + offsets * 3 + 1, g.to(tl.uint8), mask=mask)
+        tl.store(img_rgb_ptr + rgb_offset + offsets * 3 + 2, b.to(tl.uint8), mask=mask)
 
     # Create video in memory
     frames = []
 
     start = time.time()
-    grid = ((N * N + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    grid_batched = ((N * N + BLOCK_SIZE - 1) // BLOCK_SIZE, images_per_chunk,)
+    img_batch = torch.empty(images_per_chunk, N * N, device="cuda")
+    img_rgb_batch = torch.empty(images_per_chunk, N * N * 3, dtype=torch.uint8, device="cuda")
     for step in tqdm(range(steps)):
         U, V = update(U, V)
 
@@ -379,34 +422,21 @@ def run_gray_scott_simulation():
         # chunk the gpu outputs
         if step % 5 == 0:
             # calculate within chunk position
-            idx = step % 50
+            idx = step % (5*images_per_chunk)
             idx = idx // 5
             V_CHUNK_GPU[idx] = V
 
         # batch coloration of images for rendering (will convert this to gpu)
 
-        if step % 50 == 49:
-            img_rgb = torch.empty(N * N * 3, dtype=torch.uint8, device="cuda")
+        if step % (5*images_per_chunk) == 49:
+            img_min_tensor = torch.tensor([float(v.min()) for v in V_CHUNK_GPU], device="cuda")
+            img_max_tensor = torch.tensor([float(v.max()) for v in V_CHUNK_GPU], device="cuda")
             for i in range(images_per_chunk):
-                # # Use V for visualization - move to CPU for numpy operations
+                img_batch[i] = V_CHUNK_GPU[i].flatten()
 
-                # # Enhanced contrast and saturation
-                # img = img ** 0.5  # Less gamma correction for more vibrant colors
+            cyberpunk_colormap_kernel[grid_batched](img_batch, img_rgb_batch, torch_colormap, img_min_tensor, img_max_tensor, N, BLOCK_SIZE)
 
-                # # Add slight contrast boost
-                # img = np.clip(img * 1.2 - 0.1, 0, 1)
-
-                v_min, v_max = float(V_CHUNK_GPU[i].min()), float(V_CHUNK_GPU[i].max())
-                # if v_max - v_min > 1e-6:
-                #     img = (img - v_min) / (v_max - v_min)
-
-                # # Convert to color
-                # img_color = custom_cmap(img)[..., :3]
-                # img_uint8 = (img_color * 255).astype(np.uint8)
-                # frames.append(img_uint8)
-                cyberpunk_colormap_kernel[grid](V_CHUNK_GPU[i], img_rgb, torch_colormap, v_min, v_max, N, BLOCK_SIZE)
-                img_rgb_reshaped = img_rgb.view(N, N, 3)
-                frames.append(img_rgb_reshaped.cpu().numpy())
+            frames.extend([img_rgb_batch[i].view(N, N, 3).cpu().numpy() for i in range(images_per_chunk)])
 
     print(f"Generated {len(frames)} frames")
 
